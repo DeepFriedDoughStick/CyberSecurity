@@ -15,7 +15,7 @@
 
 // 服务器编译运行：
 // 1. g++ -std=c++11 Initialize.cpp -o vpn_server -lssl -lcrypto -lpthread
-// 2. ./vpn_server
+// 2. sudo ./vpn_server
 
 // 客户端测试：
 // openssl s_client -connect localhost:8443
