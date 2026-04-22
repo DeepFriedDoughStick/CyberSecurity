@@ -48,9 +48,10 @@ map<int, ClientInfo> connected_clients;
  * 初始化 SSL/TLS 库和上下文
  */
 bool InitializeSSL() {
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
-    SSL_load_error_strings();
+    OPENSSL_init_ssl(0,NULL);
+    // SSL_library_init();
+    // OpenSSL_add_all_algorithms();
+    // SSL_load_error_strings();
     
     ssl_ctx = SSL_CTX_new(TLS_server_method());
     if (!ssl_ctx) {
@@ -95,7 +96,7 @@ void ConfigureSSLSecurity() {
     SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
     
     // 设置密码套件（兼容性更好）
-    SSL_CTX_set_cipher_list(ssl_ctx, "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK");
+    SSL_CTX_set_cipher_list(ssl_ctx, "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK");//可能仅保留DEFAULT，不指定禁用套件。
 }
 
 // ==================== 身份认证模块 ====================
@@ -242,6 +243,7 @@ void HandleClient(int client_socket, struct sockaddr_in client_addr) {
         return;
     }
     
+    //插入SSL层，绑定SOCKET
     SSL_set_fd(ssl, client_socket);
     
     // 执行 SSL/TLS 握手
@@ -361,7 +363,7 @@ bool StartVPNServer() {
     
     // 加载自签名证书和私钥
     if (!LoadServerCertificateAndKey("server.crt", "server.key")) {
-        cerr << "证书加载失败，请先生成证书:" << endl;
+        cerr << "证书加载失败，可能是证书不存在或损坏，请先生成证书:" << endl;
         cerr << "  openssl genrsa -out server.key 2048" << endl;
         cerr << "  openssl req -new -x509 -key server.key -out server.crt -days 365" << endl;
         return false;
