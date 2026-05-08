@@ -69,9 +69,10 @@ void ConfigureTun(const char* dev, const char* server_ip, const char* client_ip)
 // ==================== SSL/TLS ====================
 
 bool InitSSL() {
-    SSL_library_init();
-    OpenSSL_add_all_algorithms();
-    SSL_load_error_strings();
+    OPENSSL_init_ssl(0,NULL);
+    // SSL_library_init();
+    // OpenSSL_add_all_algorithms();
+    // SSL_load_error_strings();
 
     ssl_ctx = SSL_CTX_new(TLS_server_method());
     if (!ssl_ctx) return false;
