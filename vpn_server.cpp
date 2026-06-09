@@ -92,7 +92,7 @@ ClientManager::ClientManager()
 ClientManager::~ClientManager()
 {
     // 断开所有客户端
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     for (auto &pair : m_clients)
     {
         pair.second->close();
@@ -105,7 +105,7 @@ bool ClientManager::addClient(int fd, const std::string &ip, int port)
 {
     auto session = std::make_shared<ClientSession>(fd, ip, port);
 
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
 
     // 检查是否已存在
     if (m_clients.find(fd) != m_clients.end())
@@ -133,7 +133,7 @@ bool ClientManager::addClient(int fd, const std::string &ip, int port)
 }
 bool ClientManager::removeClient(int fd)
 {
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
 
     auto it = m_clients.find(fd);
     if (it == m_clients.end())
@@ -174,7 +174,7 @@ bool ClientManager::removeClient(int fd)
 }
 bool ClientManager::removeClientByIP(const std::string &virtual_ip)
 {
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
 
     auto it = m_ip_map.find(virtual_ip);
     if (it == m_ip_map.end())
@@ -189,7 +189,7 @@ bool ClientManager::removeClientByIP(const std::string &virtual_ip)
 }
 ClientManager::SessionPtr ClientManager::getClient(int fd)
 {
-    std::shared_lock<std::mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
 
     auto it = m_clients.find(fd);
     if (it != m_clients.end())
@@ -200,7 +200,7 @@ ClientManager::SessionPtr ClientManager::getClient(int fd)
 }
 ClientManager::SessionPtr ClientManager::getClientByIP(const std::string &virtual_ip)
 {
-    std::shared_lock<std::mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
 
     auto it = m_ip_map.find(virtual_ip);
     if (it != m_ip_map.end())
@@ -211,7 +211,7 @@ ClientManager::SessionPtr ClientManager::getClientByIP(const std::string &virtua
 }
 ClientManager::SessionPtr ClientManager::getClientByUsername(const std::string &username)
 {
-    std::shared_lock<std::mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
 
     auto it = m_username_map.find(username);
     if (it != m_username_map.end())
@@ -222,7 +222,7 @@ ClientManager::SessionPtr ClientManager::getClientByUsername(const std::string &
 }
 std::vector<ClientManager::SessionPtr> ClientManager::getAllClients()
 {
-    std::shared_lock<std::mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
 
     std::vector<SessionPtr> clients;
     clients.reserve(m_clients.size());
@@ -236,7 +236,7 @@ std::vector<ClientManager::SessionPtr> ClientManager::getAllClients()
 }
 std::vector<std::string> ClientManager::getAllVirtualIPs()
 {
-    std::shared_lock<std::mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
 
     std::vector<std::string> ips;
     ips.reserve(m_ip_map.size());
@@ -250,12 +250,12 @@ std::vector<std::string> ClientManager::getAllVirtualIPs()
 }
 bool ClientManager::canAcceptNewClient(int max_clients)
 {
-    std::shared_lock<std::mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
     return m_clients.size() < static_cast<size_t>(max_clients);
 }
 int ClientManager::getClientCount() const
 {
-    std::shared_lock<std::mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
     return m_clients.size();
 }
 void ClientManager::cleanupTimeoutClients(int timeout_seconds)
@@ -264,7 +264,7 @@ void ClientManager::cleanupTimeoutClients(int timeout_seconds)
 
     // 收集超时的客户端
     {
-        std::shared_lock<std::mutex> lock(m_mutex);
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
         for (auto &pair : m_clients)
         {
             if (pair.second->isTimeout(timeout_seconds))
@@ -287,7 +287,7 @@ void ClientManager::cleanupTimeoutClients(int timeout_seconds)
 }
 std::string ClientManager::allocateVirtualIP(const std::string &preferred_ip)
 {
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
 
     // 如果指定了IP且未被分配，使用指定IP
     if (!preferred_ip.empty())
@@ -314,12 +314,12 @@ std::string ClientManager::allocateVirtualIP(const std::string &preferred_ip)
 }
 void ClientManager::releaseVirtualIP(const std::string &ip)
 {
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
     m_allocated_ips.erase(ip);
 }
 void ClientManager::broadcastToAll(const uint8_t *data, int len, int exclude_fd)
 {
-    std::shared_lock<std::mutex> lock(m_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
 
     for (auto &pair : m_clients)
     {
