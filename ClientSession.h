@@ -6,6 +6,9 @@
 #include <memory>
 #include <functional>
 
+// OpenSSL 前向声明，避免在头文件中引入完整的 openssl 头
+typedef struct ssl_st SSL;
+
 // 客户端状态
 enum class ClientState {
     HANDSHAKING,    // 握手中
@@ -55,6 +58,11 @@ public:
     void setUsername(const std::string& name) { m_info.username = name; }
     void setVirtualIP(const std::string& ip) { m_info.virtual_ip = ip; }
     void setEncryptionSession(std::shared_ptr<EncryptedSession> enc) { m_encryption = enc; }
+
+    // TLS 连接管理（多线程：处理线程读取、分发线程写入）
+    void setSSL(SSL *ssl);
+    int sslWritePacket(const void *data, int len); // 线程安全：写入 [4字节长度][数据]
+    void detachAndFreeSSL();                        // 线程安全：优雅关闭并释放 TLS
     
     const ClientInfo& getInfo() const { return m_info; }
     int getSocketFd() const { return m_socket_fd; }
@@ -77,4 +85,7 @@ private:
     ClientInfo m_info;
     std::shared_ptr<EncryptedSession> m_encryption;
     mutable std::mutex m_mutex;  // 保护本会话的操作
+
+    SSL *m_ssl = nullptr;            // TLS 连接：处理线程读取、分发线程写入
+    mutable std::mutex m_ssl_mutex;  // 保护 m_ssl 的写入与释放，避免 use-after-free
 };

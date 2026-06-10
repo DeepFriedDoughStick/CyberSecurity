@@ -13,15 +13,13 @@
 #include <map>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <openssl/rand.h>
-#include <openssl/evp.h>
 #include "ClientSession.h"
 #include "ClientManager.h"
 #include <shared_mutex>
 #include <random>
 #include <iomanip>
 
-// g++ -std=c++11 vpn_server.cpp -o vpn_server -lssl -lcrypto -lpthread
+// g++ -std=c++17 vpn_server.cpp -o vpn_server -lssl -lcrypto -lpthread
 // sudo ./vpn_server
 ClientSession::ClientSession(int fd, const std::string &client_ip, int client_port)
     : m_socket_fd(fd), m_state(ClientState::HANDSHAKING)
@@ -77,6 +75,39 @@ void ClientSession::close()
         m_socket_fd = -1;
     }
     m_state = ClientState::DISCONNECTED;
+}
+void ClientSession::setSSL(SSL *ssl)
+{
+    std::lock_guard<std::mutex> lock(m_ssl_mutex);
+    m_ssl = ssl;
+}
+int ClientSession::sslWritePacket(const void *data, int len)
+{
+    // 在同一把锁内写出 [4字节长度][数据]，保证一个数据帧的原子性，
+    // 并通过判空避免向已被释放的 SSL 写入（use-after-free）
+    std::lock_guard<std::mutex> lock(m_ssl_mutex);
+    if (!m_ssl)
+        return -1;
+    uint32_t net_len = htonl((uint32_t)len);
+    if (SSL_write(m_ssl, &net_len, 4) <= 0)
+        return -1;
+    if (SSL_write(m_ssl, data, len) <= 0)
+        return -1;
+    return len;
+}
+void ClientSession::detachAndFreeSSL()
+{
+    SSL *s = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_ssl_mutex);
+        s = m_ssl;
+        m_ssl = nullptr; // 置空后，分发线程不会再使用该连接
+    }
+    if (s)
+    {
+        SSL_shutdown(s);
+        SSL_free(s);
+    }
 }
 
 ClientManager::ClientManager()
@@ -144,10 +175,12 @@ bool ClientManager::removeClient(int fd)
     auto session = it->second;
 
     // 从所有映射表中移除
+    // 注意：此处已持有 m_mutex，必须直接擦除 m_allocated_ips，
+    // 不能调用 releaseVirtualIP（它会再次锁 m_mutex，导致递归死锁 EDEADLK）
     if (!session->getInfo().virtual_ip.empty())
     {
         m_ip_map.erase(session->getInfo().virtual_ip);
-        releaseVirtualIP(session->getInfo().virtual_ip);
+        m_allocated_ips.erase(session->getInfo().virtual_ip);
     }
 
     if (!session->getInfo().username.empty())
@@ -317,6 +350,16 @@ void ClientManager::releaseVirtualIP(const std::string &ip)
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     m_allocated_ips.erase(ip);
 }
+bool ClientManager::assignVirtualIP(int fd, const std::string &ip)
+{
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    auto it = m_clients.find(fd);
+    if (it == m_clients.end())
+        return false;
+    it->second->setVirtualIP(ip);
+    m_ip_map[ip] = it->second; // 登记 virtual_ip -> session，供分发线程按目的IP查找
+    return true;
+}
 void ClientManager::broadcastToAll(const uint8_t *data, int len, int exclude_fd)
 {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
@@ -399,11 +442,10 @@ using namespace std;
 
 #define VPN_PORT 8443
 #define BUFFER_SIZE 4096
-#define AES_KEY_LEN 32 // AES-256
-#define AES_IV_LEN 16
 
 SSL_CTX *ssl_ctx = nullptr;
 ClientManager client_manager;
+int g_tun_fd = -1; // 服务端共享 TUN 虚拟网卡（所有客户端共用一块网卡）
 
 // ==================== TUN 接口 ====================
 
@@ -436,18 +478,18 @@ int CreateTun(char *dev_name)
 }
 
 /**
- * 用 ip 命令配置 TUN 接口地址并启用
- * server_ip: 服务端 TUN 地址
- * client_ip: 客户端 TUN 地址（peer）
+ * 用 ip 命令为共享 TUN 配置子网地址并启用
+ * cidr: 例如 "10.8.0.1/24"，服务端在该子网内的地址
+ * 所有客户端共用这块网卡，服务端按数据包目的 IP 转发给对应客户端
  */
-void ConfigureTun(const char *dev, const char *server_ip, const char *client_ip)
+void ConfigureServerTun(const char *dev, const char *cidr)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ip addr add %s peer %s dev %s", server_ip, client_ip, dev);
+    snprintf(cmd, sizeof(cmd), "ip addr add %s dev %s", cidr, dev);
     system(cmd);
     snprintf(cmd, sizeof(cmd), "ip link set dev %s up", dev);
     system(cmd);
-    cout << "[TUN] " << dev << " 已配置: " << server_ip << " <-> " << client_ip << endl;
+    cout << "[TUN] " << dev << " 已配置: " << cidr << endl;
 }
 
 // ==================== SSL/TLS ====================
@@ -482,60 +524,10 @@ bool InitSSL()
     return true;
 }
 
-// ==================== AES-256-CBC 加解密 ====================
-// 与客户端 vpn_client.cpp 中的实现保持一致，保证两端可以互相加解密
-
-/**
- * AES-256-CBC 加密
- * in/in_len: 明文及其长度  key/iv: 32 字节密钥与 16 字节初始向量
- * out: 输出密文缓冲区（调用方需保证至少 in_len + EVP_MAX_BLOCK_LENGTH 大小）
- * 返回: 密文长度，失败返回 -1
- */
-int AesEncrypt(const unsigned char *in, int in_len,
-               const unsigned char *key, const unsigned char *iv,
-               unsigned char *out)
-{
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    int len = 0, total = 0;
-    if (!EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key, iv) ||
-        !EVP_EncryptUpdate(ctx, out, &len, in, in_len))
-    {
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    total = len;
-    EVP_EncryptFinal_ex(ctx, out + len, &len); // 处理 PKCS#7 填充
-    total += len;
-    EVP_CIPHER_CTX_free(ctx);
-    return total;
-}
-
-/**
- * AES-256-CBC 解密，参数含义与 AesEncrypt 对称
- * 返回: 明文长度，失败返回 -1
- */
-int AesDecrypt(const unsigned char *in, int in_len,
-               const unsigned char *key, const unsigned char *iv,
-               unsigned char *out)
-{
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    int len = 0, total = 0;
-    if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key, iv) ||
-        !EVP_DecryptUpdate(ctx, out, &len, in, in_len))
-    {
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    total = len;
-    if (!EVP_DecryptFinal_ex(ctx, out + len, &len))
-    { // 校验并去除填充
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    total += len;
-    EVP_CIPHER_CTX_free(ctx);
-    return total;
-}
+// ==================== 数据传输说明 ====================
+// 不再在应用层做 AES：SSL_read/SSL_write 已由 TLS 记录层负责机密性与完整性，
+// 隧道内传输的就是「原始 IP 包」，外层 TLS 即为唯一且足够的加密层。
+// 仍使用 [4字节长度][数据] 的帧格式来解决 TCP 字节流的粘包/拆包问题。
 
 /**
  * 从 SSL 连接中读取「恰好」len 字节
@@ -556,6 +548,46 @@ bool SSL_read_full(SSL *ssl, void *buf, int len)
     return true;
 }
 
+// ==================== TUN -> 客户端 分发线程 ====================
+
+/**
+ * 单独一个线程从共享 TUN 读取内核发出的 IP 包，
+ * 按「目的 IP」找到对应客户端会话，经其 TLS 连接发送出去。
+ * 这样多个客户端可以共用一块网卡，并支持客户端之间互通（需开启 ip_forward）。
+ */
+void TunToClients()
+{
+    unsigned char pkt[BUFFER_SIZE];
+    while (true)
+    {
+        int len = read(g_tun_fd, pkt, sizeof(pkt));
+        if (len <= 0)
+        {
+            if (len < 0)
+                perror("read tun");
+            continue;
+        }
+        if (len < 20 || (pkt[0] >> 4) != 4)
+            continue; // 仅处理 IPv4 数据包
+
+        // IPv4 头部第 16~19 字节为目的地址
+        char dst[INET_ADDRSTRLEN];
+        struct in_addr a;
+        memcpy(&a, pkt + 16, 4);
+        inet_ntop(AF_INET, &a, dst, sizeof(dst));
+
+        auto session = client_manager.getClientByIP(dst);
+        if (!session)
+            continue; // 无对应客户端，丢弃
+
+        if (session->sslWritePacket(pkt, len) > 0)
+        {
+            session->addBytesSent(len);
+            session->updateActivity();
+        }
+    }
+}
+
 // ==================== 客户端处理线程 ====================
 
 void HandleClient(int sock, struct sockaddr_in addr)
@@ -566,16 +598,16 @@ void HandleClient(int sock, struct sockaddr_in addr)
     client_manager.addClient(sock, client_ip, ntohs(addr.sin_port));
     auto session = client_manager.getClient(sock);
 
-    // —— 1. TLS 握手 ——
+    // —— 1. TLS 握手 ——（TLS 握手层完成密钥协商 ECDHE、加密协商与服务器身份认证）
     SSL *ssl = SSL_new(ssl_ctx);
     SSL_set_fd(ssl, sock);
     if (SSL_accept(ssl) <= 0)
     {
         cerr << "[TLS] 握手失败 (" << client_ip << ")" << endl;
         ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
         session->setState(ClientState::DISCONNECTED);
         client_manager.removeClient(sock);
-        SSL_free(ssl);
         return;
     }
     cout << "[TLS] 握手成功: " << client_ip << endl;
@@ -594,161 +626,108 @@ void HandleClient(int sock, struct sockaddr_in addr)
     buf[n] = '\0';
 
     string auth(buf);
-    // 去除尾部换行
     while (!auth.empty() && (auth.back() == '\n' || auth.back() == '\r'))
         auth.pop_back();
 
     size_t sep = auth.find(':');
-    if (sep == string::npos)
+    bool auth_ok = false;
+    string user;
+    if (sep != string::npos)
     {
-        SSL_write(ssl, "AUTH_FAILED", 11);
-        SSL_free(ssl);
-        session->setState(ClientState::DISCONNECTED);
-        client_manager.removeClient(sock);
-        return;
+        user = auth.substr(0, sep);
+        string pass = auth.substr(sep + 1);
+        auth_ok = (user == "vpnuser" && pass == "secure_password_123");
     }
-    string user = auth.substr(0, sep);
-    string pass = auth.substr(sep + 1);
-
-    if (user != "vpnuser" || pass != "secure_password_123")
+    if (!auth_ok)
     {
         cerr << "[Auth] 认证失败: " << user << endl;
-        SSL_write(ssl, "AUTH_FAILED", 11);
+        SSL_write(ssl, "FAIL\n", 5);
         SSL_free(ssl);
         session->setState(ClientState::DISCONNECTED);
         client_manager.removeClient(sock);
         return;
     }
-    cout << "[Auth] 认证成功: " << user << endl;
-    SSL_write(ssl, "AUTH_SUCCESS", 12);
     session->setUsername(user);
+
+    // —— 3. 分配虚拟 IP（从 10.8.0.2~254 地址池中取一个空闲地址）——
+    string vip = client_manager.allocateVirtualIP();
+    if (vip.empty())
+    {
+        cerr << "[IP] 地址池已满，拒绝: " << user << endl;
+        SSL_write(ssl, "FAIL\n", 5);
+        SSL_free(ssl);
+        session->setState(ClientState::DISCONNECTED);
+        client_manager.removeClient(sock);
+        return;
+    }
+    client_manager.assignVirtualIP(sock, vip);
+    cout << "[Auth] 认证成功: " << user << "，分配虚拟IP " << vip << endl;
+
+    // 下发认证结果与分配到的虚拟 IP，格式："OK <ip>\n"
+    string resp = "OK " + vip + "\n";
+    if (SSL_write(ssl, resp.c_str(), (int)resp.size()) <= 0)
+    {
+        SSL_free(ssl);
+        session->setState(ClientState::DISCONNECTED);
+        client_manager.removeClient(sock);
+        return;
+    }
+
+    // —— 4. 注册 TLS 连接，进入数据转发 ——
+    // 数据通道直接走 TLS（已提供机密性与完整性），不再叠加应用层 AES。
+    session->setSSL(ssl);
     session->setState(ClientState::CONNECTED);
+    cout << "[VPN] 隧道建立: " << client_ip << " -> " << vip << endl;
 
-    // —— 3. 密钥协商 ——
-    // 由服务端生成随机的 AES-256 会话密钥与 IV，并通过已加密的 TLS 通道下发给客户端。
-    // 客户端会按「先密钥后 IV」的顺序接收（见 vpn_client.cpp 第 146~155 行）。
-    unsigned char session_key[AES_KEY_LEN]; // AES-256 会话密钥（32 字节）
-    unsigned char session_iv[AES_IV_LEN];   // CBC 模式初始向量（16 字节）
-
-    if (RAND_bytes(session_key, AES_KEY_LEN) != 1 ||
-        RAND_bytes(session_iv, AES_IV_LEN) != 1)
-    {
-        cerr << "[密钥协商] 随机密钥生成失败" << endl;
-        SSL_free(ssl);
-        session->setState(ClientState::DISCONNECTED);
-        client_manager.removeClient(sock);
-        return;
-    }
-    // 顺序必须与客户端接收顺序一致：先发送密钥，再发送 IV
-    if (SSL_write(ssl, session_key, AES_KEY_LEN) <= 0 ||
-        SSL_write(ssl, session_iv, AES_IV_LEN) <= 0)
-    {
-        cerr << "[密钥协商] 密钥下发失败" << endl;
-        SSL_free(ssl);
-        session->setState(ClientState::DISCONNECTED);
-        client_manager.removeClient(sock);
-        return;
-    }
-    cout << "[密钥协商] 会话密钥已下发: " << client_ip << endl;
-
-    // —— 4. 创建并配置服务端 TUN 虚拟网卡 ——
-    char tun_name[IFNAMSIZ] = "vpntun0";
-    int tun_fd = CreateTun(tun_name);
-    if (tun_fd < 0)
-    {
-        cerr << "[TUN] 创建失败" << endl;
-        SSL_free(ssl);
-        session->setState(ClientState::DISCONNECTED);
-        client_manager.removeClient(sock);
-        return;
-    }
-    // 服务端虚拟 IP = 10.8.0.1，对端（客户端）= 10.8.0.2
-    ConfigureTun(tun_name, "10.8.0.1", "10.8.0.2");
-
-    // —— 5. 双向加密转发 ——
-    cout << "[VPN] 开始加密转发 (" << client_ip << ")" << endl;
-    unsigned char plain[BUFFER_SIZE + EVP_MAX_BLOCK_LENGTH];  // 明文 IP 包缓冲
-    unsigned char cipher[BUFFER_SIZE + EVP_MAX_BLOCK_LENGTH]; // 密文缓冲
-
+    // —— 5. 客户端 -> 服务器：从 TLS 读取数据帧并写入共享 TUN ——
+    // （服务器 -> 客户端方向由 TunToClients 分发线程负责）
+    unsigned char pkt[BUFFER_SIZE];
     while (true)
     {
-        // 用 select 同时监听 TUN 网卡与 TLS socket，任一可读即处理
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(tun_fd, &fds);
-        FD_SET(sock, &fds);
-        int max_fd = max(tun_fd, sock) + 1;
-
-        if (select(max_fd, &fds, nullptr, nullptr, nullptr) < 0)
+        uint32_t net_len = 0;
+        if (!SSL_read_full(ssl, &net_len, 4))
+            break;
+        int len = (int)ntohl(net_len);
+        if (len <= 0 || len > (int)sizeof(pkt))
+            break;
+        if (!SSL_read_full(ssl, pkt, len))
             break;
 
-        // ── 方向一：TUN → 加密 → TLS（把本机要发给客户端的 IP 包送出去）──
-        if (FD_ISSET(tun_fd, &fds))
-        {
-            int pkt_len = read(tun_fd, plain, BUFFER_SIZE);
-            if (pkt_len <= 0)
-                break;
-
-            // 先 AES-256-CBC 加密明文 IP 包
-            int enc_len = AesEncrypt(plain, pkt_len, session_key, session_iv, cipher);
-            if (enc_len < 0)
-                continue;
-
-            // 帧格式: [4字节网络序长度][密文]，解决 TCP 字节流的粘包/拆包问题
-            uint32_t net_len = htonl((uint32_t)enc_len);
-            if (SSL_write(ssl, &net_len, 4) <= 0)
-                break;
-            if (SSL_write(ssl, cipher, enc_len) <= 0)
-                break;
-
-            // 更新流量统计与活动时间（用于超时检测）
-            session->addBytesSent(enc_len);
-            session->updateActivity();
-        }
-
-        // ── 方向二：TLS → 解密 → TUN（接收客户端发来的 IP 包）──
-        if (FD_ISSET(sock, &fds))
-        {
-            // 先读 4 字节长度头（读满，避免 TLS 分段导致的错位）
-            uint32_t net_len = 0;
-            if (!SSL_read_full(ssl, &net_len, 4))
-                break;
-            int enc_len = (int)ntohl(net_len);
-            if (enc_len <= 0 || enc_len > (int)sizeof(cipher))
-                break;
-
-            // 再读对应长度的密文
-            if (!SSL_read_full(ssl, cipher, enc_len))
-                break;
-
-            // AES-256-CBC 解密还原明文 IP 包
-            int pkt_len = AesDecrypt(cipher, enc_len, session_key, session_iv, plain);
-            if (pkt_len > 0)
-            {
-                write(tun_fd, plain, pkt_len); // 写回 TUN，交给内核协议栈处理
-                session->addBytesReceived(enc_len);
-                session->updateActivity();
-            }
-        }
+        if (write(g_tun_fd, pkt, len) < 0)
+            break;
+        session->addBytesReceived(len);
+        session->updateActivity();
     }
 
-    cout << "[VPN] 客户端断开: " << client_ip << endl;
-    close(tun_fd);
-    client_manager.removeClient(sock);
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close(sock);
+    cout << "[VPN] 客户端断开: " << client_ip << " (" << vip << ")" << endl;
+    session->detachAndFreeSSL();        // 先优雅关闭并释放 TLS（socket 仍打开）
+    client_manager.removeClient(sock);  // 注销会话、释放虚拟IP、关闭 socket
 }
 
 // ==================== 主程序 ====================
 
 int main()
 {
-    cout << "====== VPN 服务器 (TLS + AES-256) ======\n"
+    cout << "====== VPN 服务器 (TLS) ======\n"
          << endl;
 
     if (!InitSSL())
         return 1;
+
+    // 创建并配置服务端共享 TUN 虚拟网卡（所有客户端共用）
+    char tun_name[IFNAMSIZ] = "vpntun0";
+    g_tun_fd = CreateTun(tun_name);
+    if (g_tun_fd < 0)
+    {
+        cerr << "[TUN] 创建失败" << endl;
+        return 1;
+    }
+    ConfigureServerTun(tun_name, "10.8.0.1/24");
+    // 开启 IP 转发，使不同客户端之间（10.8.0.0/24）可以互通
+    system("sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1");
+
+    // 启动 TUN -> 客户端 的分发线程
+    thread(TunToClients).detach();
 
     client_manager.setOnClientConnect([](ClientManager::SessionPtr session)
                                       {

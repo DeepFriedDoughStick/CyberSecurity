@@ -48,6 +48,7 @@ public:
     // IP分配管理
     std::string allocateVirtualIP(const std::string &preferred_ip = "");
     void releaseVirtualIP(const std::string &ip);
+    bool assignVirtualIP(int fd, const std::string &ip); // 绑定虚拟IP到会话并登记到 ip_map
 
     // 广播消息
     void broadcastToAll(const uint8_t *data, int len, int exclude_fd = -1);

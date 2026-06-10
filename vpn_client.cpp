@@ -11,7 +11,7 @@
 #include <fcntl.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <openssl/evp.h>
+#include <openssl/x509.h>
 
 // g++ -std=c++11 vpn_client.cpp -o vpn_client -lssl -lcrypto -lpthread
 // sudo ./vpn_client <服务器IP> (127.0.0.1)
@@ -21,8 +21,6 @@ using namespace std;
 
 #define VPN_PORT    8443
 #define BUFFER_SIZE 4096
-#define AES_KEY_LEN 32
-#define AES_IV_LEN  16
 
 // ==================== TUN 接口（与服务端相同）====================
 
@@ -56,40 +54,23 @@ void ConfigureTun(const char* dev, const char* client_ip, const char* server_ip)
     cout << "[TUN] " << dev << " 已配置: " << client_ip << " <-> " << server_ip << endl;
 }
 
-// ==================== AES-256-CBC ====================
+// ==================== 工具函数 ====================
+// 不再使用应用层 AES：TLS（SSL_read/SSL_write）已负责机密性与完整性，
+// 隧道内直接传输原始 IP 包，外层 TLS 即为唯一加密层。
 
-int AesEncrypt(const unsigned char* in, int in_len,
-               const unsigned char* key, const unsigned char* iv,
-               unsigned char* out) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    int len = 0, total = 0;
-    if (!EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key, iv) ||
-        !EVP_EncryptUpdate(ctx, out, &len, in, in_len)) {
-        EVP_CIPHER_CTX_free(ctx); return -1;
+/**
+ * 从 SSL 连接中读取「恰好」len 字节，避免 TLS 分段导致的帧错位
+ * 返回 true 表示读满，false 表示连接断开或出错
+ */
+bool SSL_read_full(SSL* ssl, void* bufp, int len) {
+    int got = 0;
+    unsigned char* p = static_cast<unsigned char*>(bufp);
+    while (got < len) {
+        int n = SSL_read(ssl, p + got, len - got);
+        if (n <= 0) return false;
+        got += n;
     }
-    total = len;
-    EVP_EncryptFinal_ex(ctx, out + len, &len);
-    total += len;
-    EVP_CIPHER_CTX_free(ctx);
-    return total;
-}
-
-int AesDecrypt(const unsigned char* in, int in_len,
-               const unsigned char* key, const unsigned char* iv,
-               unsigned char* out) {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    int len = 0, total = 0;
-    if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key, iv) ||
-        !EVP_DecryptUpdate(ctx, out, &len, in, in_len)) {
-        EVP_CIPHER_CTX_free(ctx); return -1;
-    }
-    total = len;
-    if (!EVP_DecryptFinal_ex(ctx, out + len, &len)) {
-        EVP_CIPHER_CTX_free(ctx); return -1;
-    }
-    total += len;
-    EVP_CIPHER_CTX_free(ctx);
-    return total;
+    return true;
 }
 
 // ==================== 主程序 ====================
@@ -105,8 +86,15 @@ int main(int argc, char* argv[]) {
     SSL_load_error_strings();
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-    // 测试环境跳过证书验证；生产环境应改为 SSL_VERIFY_PEER 并加载 CA 证书
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    // 校验服务器身份：把服务端自签证书 server.crt 作为受信任的 CA 加载，
+    // 并开启 SSL_VERIFY_PEER，防止中间人攻击（替代原先不安全的 VERIFY_NONE）
+    if (SSL_CTX_load_verify_locations(ctx, "server.crt", nullptr) != 1) {
+        cerr << "[SSL] 加载受信任证书 server.crt 失败" << endl;
+        ERR_print_errors_fp(stderr);
+        return 1;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
 
     // —— 2. TCP 连接 ——
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -128,43 +116,44 @@ int main(int argc, char* argv[]) {
         ERR_print_errors_fp(stderr);
         return 1;
     }
+    // 复核证书校验结果（SSL_VERIFY_PEER 下握手失败一般已返回，这里再确认一次）
+    if (SSL_get_verify_result(ssl) != X509_V_OK) {
+        cerr << "[TLS] 服务器证书校验失败" << endl;
+        SSL_free(ssl); close(sock); return 1;
+    }
     cout << "[TLS] 握手成功，加密算法: " << SSL_get_cipher(ssl) << endl;
 
     // —— 4. 身份认证 ——
     string auth = "vpnuser:secure_password_123";
     SSL_write(ssl, auth.c_str(), auth.length());
 
-    char resp[16] = {0};
-    SSL_read(ssl, resp, 12);
-    resp[12] = '\0';
-    if (string(resp) != "AUTH_SUCCESS") {
-        cerr << "[Auth] 认证失败: " << resp << endl;
+    // 接收认证结果与服务端分配的虚拟 IP，格式："OK <ip>\n" 或 "FAIL\n"
+    char resp[64] = {0};
+    int rn = SSL_read(ssl, resp, sizeof(resp) - 1);
+    if (rn <= 0) {
+        cerr << "[Auth] 未收到服务器响应" << endl;
         SSL_free(ssl); close(sock); return 1;
     }
-    cout << "[Auth] 认证成功" << endl;
-
-    // —— 5. 接收服务端发来的会话密钥和 IV（密钥协商）——
-    unsigned char session_key[AES_KEY_LEN];
-    unsigned char session_iv[AES_IV_LEN];
-
-    if (SSL_read(ssl, session_key, AES_KEY_LEN) <= 0 ||
-        SSL_read(ssl, session_iv,  AES_IV_LEN)  <= 0) {
-        cerr << "[密钥协商] 接收密钥失败" << endl;
-        return 1;
+    resp[rn] = '\0';
+    string r(resp);
+    while (!r.empty() && (r.back() == '\n' || r.back() == '\r')) r.pop_back();
+    if (r.rfind("OK ", 0) != 0) {
+        cerr << "[Auth] 认证失败: " << r << endl;
+        SSL_free(ssl); close(sock); return 1;
     }
-    cout << "[密钥协商] 会话密钥接收成功" << endl;
+    string vip = r.substr(3);   // 服务端分配的虚拟 IP（密钥协商已由 TLS 握手完成）
+    cout << "[Auth] 认证成功，分配虚拟IP: " << vip << endl;
 
-    // —— 6. 创建 TUN 接口 ——
+    // —— 5. 创建并配置 TUN 接口（使用服务端分配的虚拟 IP）——
     char tun_name[IFNAMSIZ] = "vpntun1";
     int tun_fd = CreateTun(tun_name);
     if (tun_fd < 0) return 1;
-    ConfigureTun(tun_name, "10.8.0.2", "10.8.0.1");
+    ConfigureTun(tun_name, vip.c_str(), "10.8.0.1");
 
-    // —— 7. 双向加密转发 ——
+    // —— 6. 双向转发（数据通道直接走 TLS，机密性与完整性由 TLS 保证）——
     cout << "[VPN] 隧道已建立，开始转发流量..." << endl;
 
-    unsigned char plain[BUFFER_SIZE + EVP_MAX_BLOCK_LENGTH];
-    unsigned char cipher[BUFFER_SIZE + EVP_MAX_BLOCK_LENGTH];
+    unsigned char pkt[BUFFER_SIZE];
 
     while (true) {
         fd_set fds;
@@ -175,31 +164,25 @@ int main(int argc, char* argv[]) {
 
         if (select(max_fd, &fds, nullptr, nullptr, nullptr) < 0) break;
 
-        // ── TUN → 加密 → SSL ──
+        // ── TUN → TLS：读取本机 IP 包，按 [4字节长度][数据] 发送 ──
         if (FD_ISSET(tun_fd, &fds)) {
-            int pkt_len = read(tun_fd, plain, BUFFER_SIZE);
-            if (pkt_len <= 0) break;
+            int len = read(tun_fd, pkt, sizeof(pkt));
+            if (len <= 0) break;
 
-            int enc_len = AesEncrypt(plain, pkt_len, session_key, session_iv, cipher);
-            if (enc_len < 0) continue;
-
-            uint32_t net_len = htonl((uint32_t)enc_len);
-            SSL_write(ssl, &net_len, 4);
-            SSL_write(ssl, cipher,  enc_len);
+            uint32_t net_len = htonl((uint32_t)len);
+            if (SSL_write(ssl, &net_len, 4) <= 0) break;
+            if (SSL_write(ssl, pkt, len) <= 0) break;
         }
 
-        // ── SSL → 解密 → TUN ──
+        // ── TLS → TUN：读满长度头与数据，写回 TUN ──
         if (FD_ISSET(sock, &fds)) {
             uint32_t net_len = 0;
-            if (SSL_read(ssl, &net_len, 4) <= 0) break;
-            int enc_len = (int)ntohl(net_len);
-            if (enc_len <= 0 || enc_len > (int)sizeof(cipher)) break;
+            if (!SSL_read_full(ssl, &net_len, 4)) break;
+            int len = (int)ntohl(net_len);
+            if (len <= 0 || len > (int)sizeof(pkt)) break;
+            if (!SSL_read_full(ssl, pkt, len)) break;
 
-            if (SSL_read(ssl, cipher, enc_len) <= 0) break;
-
-            int pkt_len = AesDecrypt(cipher, enc_len, session_key, session_iv, plain);
-            if (pkt_len > 0)
-                write(tun_fd, plain, pkt_len);
+            if (write(tun_fd, pkt, len) < 0) break;
         }
     }
 
