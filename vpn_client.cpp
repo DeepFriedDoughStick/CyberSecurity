@@ -43,7 +43,9 @@ int CreateTun(char* dev_name) {
 
 void ConfigureTun(const char* dev, const char* client_ip, const char* server_ip) {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ip addr add %s peer %s dev %s", client_ip, server_ip, dev);
+    // 用 /24 子网地址配置（而非点对点 peer），这样会自动生成 10.8.0.0/24 dev 路由，
+    // 客户端不仅能到达服务端，还能到达同子网内的其他客户端（依赖服务端 ip_forward）。
+    snprintf(cmd, sizeof(cmd), "ip addr add %s/24 dev %s", client_ip, dev);
     system(cmd);
     snprintf(cmd, sizeof(cmd), "ip link set dev %s up", dev);
     system(cmd);
@@ -51,7 +53,7 @@ void ConfigureTun(const char* dev, const char* client_ip, const char* server_ip)
     // 在单机测试时，必须把下面这两行注释掉！否则会路由环路，导致连接断开
     // snprintf(cmd, sizeof(cmd), "ip route add default via %s dev %s", server_ip, dev);
     // system(cmd);
-    cout << "[TUN] " << dev << " 已配置: " << client_ip << " <-> " << server_ip << endl;
+    cout << "[TUN] " << dev << " 已配置: " << client_ip << "/24 (网关 " << server_ip << ")" << endl;
 }
 
 // ==================== 工具函数 ====================
