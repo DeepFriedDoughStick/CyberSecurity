@@ -345,11 +345,6 @@ std::string ClientManager::allocateVirtualIP(const std::string &preferred_ip)
 
     return ""; // IP池已满
 }
-void ClientManager::releaseVirtualIP(const std::string &ip)
-{
-    std::unique_lock<std::shared_mutex> lock(m_mutex);
-    m_allocated_ips.erase(ip);
-}
 bool ClientManager::assignVirtualIP(int fd, const std::string &ip)
 {
     std::unique_lock<std::shared_mutex> lock(m_mutex);

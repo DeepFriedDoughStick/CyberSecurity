@@ -13,7 +13,7 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 
-// g++ -std=c++11 vpn_client.cpp -o vpn_client -lssl -lcrypto -lpthread
+// g++ -std=c++17 vpn_client.cpp -o vpn_client -lssl -lcrypto -lpthread
 // sudo ./vpn_client <服务器IP> (127.0.0.1)
 // ping 10.8.0.1 测试
 
